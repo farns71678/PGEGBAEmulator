@@ -1,3 +1,6 @@
 [submodule "lib/emsdk"]
 	path = lib/emsdk
 	url = https://github.com/emscripten-core/emsdk.git
+[submodule "include/mgba-plugin"]
+	path = include/mgba-plugin
+	url = https://github.com/RGProgrammer/mGBA-toPlugin-public.git
