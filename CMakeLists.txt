@@ -82,6 +82,22 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 # Executable aka binary output
 add_executable(${OutputExecutable} ${SOURCE_CXX_FILES})
 
+# If the mgba plugin subproject is present, build and link it so the
+# public header `include/mgba-plugin/mgba_plugin.h` can be included by
+# the main project. This also makes the `mgba_plugin` target available
+# for linking.
+if (IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/mgba-plugin")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/include/mgba-plugin)
+    # Make the top-level `include/` folder available to the main target
+    # so client code can `#include "mgba-plugin/mgba_plugin.h"`.
+    target_include_directories(${OutputExecutable} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    # Link the plugin target to the main executable
+    target_link_libraries(${OutputExecutable} PRIVATE mgba_plugin)
+endif()
+
+# libraries
+#add_library(mgba_plugin STATIC "include/mgba-plugin/mgba_plugin.cpp" "include/mgba-plugin/GameBoyAudio.cpp" "include/mgba-plugin/GameBoySave.cpp")
+
 ######################################################################
 # MacOS
 ######################################################################
@@ -234,6 +250,7 @@ if (EMSCRIPTEN)
     
     # Generate an HTML file
     set(CMAKE_EXECUTABLE_SUFFIX .html)
+    set_target_properties(TestApp PROPERTIES OUTPUT_NAME "index")
 
     # Build Cache: SDL2_mixer, libpng, zlib
     execute_process(COMMAND "${EMSCRIPTEN_ROOT_PATH}/embuilder${EMCC_SUFFIX}" build sdl2_mixer libpng zlib)
@@ -247,6 +264,7 @@ if (EMSCRIPTEN)
             -sMIN_WEBGL_VERSION=2
             -sUSE_LIBPNG=1
             -sLLD_REPORT_UNDEFINED
+            -sEXPORTED_RUNTIME_METHODS=['HEAPF32']
             --preload-file ${SOURCE_DATA_DIR}@assets)
     else()
         target_link_options(
@@ -256,7 +274,8 @@ if (EMSCRIPTEN)
             -sMAX_WEBGL_VERSION=2
             -sMIN_WEBGL_VERSION=2
             -sUSE_LIBPNG=1
-            -sLLD_REPORT_UNDEFINED)
+            -sLLD_REPORT_UNDEFINED
+            -sEXPORTED_RUNTIME_METHODS=['HEAPF32'])
     endif()
 
 endif() # Emscripten

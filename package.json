@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "scripts": {
+    "setup": "source '/workspaces/PGEGBAEmulator/lib/emsdk/emsdk_env.sh'",
+    "build:enmake": "/workspaces/PGEGBAEmulator/lib/emsdk/emcmake cmake . -B emscripten-build",
+    "build": "cmake --build emscripten-build",
+    "build-both": "npm run build:enmake && npm run build"
+  }
+}

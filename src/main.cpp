@@ -1,364 +1,389 @@
-#include "olcPixelGameEngine.h"
+//#define M_CORE_GBA
+
 #include "olcPGEX_MiniAudio.h"
+#include "olcPixelGameEngine.h"
+#include "mgba-plugin/mgba_plugin.h"
+#include "miniaudio.h"
+#include <vector>
+#include <atomic>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <chrono>
+/**
+ * source "/workspaces/PGEGBAEmulator/lib/emsdk/emsdk_env.sh"
+ * 
+ * To Build:
+ * emcmake cmake . -B emscripten-build
+ * cmake --build emscripten-build --target GBAEmulatorApp -- -j 8
+ */
 
+const auto SCREEN_HEIGHT = 160;
+const auto  SCREEN_WIDTH = 240;
+constexpr auto SCREEN_RATIO = SCREEN_WIDTH / (float)SCREEN_HEIGHT;
+const float frameTime = 1.0f/ 60.0f;
 
-class OneLoneCoder_Asteroids : public olc::PixelGameEngine
+const uint16_t MAX_KEYS = 10;
+const char* keys[] = {
+    "A",
+    "B",
+    "Select",
+    "Start",
+    "Right",
+    "Left",
+    "Up",
+    "Down",
+    "R",
+    "L"
+};
+
+std::map<std::string, olc::Key> keyMap = {
+    {"A", olc::Z},
+    {"B", olc::X},
+    {"Select", olc::SHIFT},
+    {"Start", olc::ENTER},
+    {"Right", olc::RIGHT},
+    {"Left", olc::LEFT},
+    {"Up", olc::UP},
+    {"Down", olc::DOWN},
+    {"R", olc::E},
+    {"L", olc::Q}
+};
+
+std::vector<uint8_t> readFile(const char* filepath);
+
+class GBAEmulatorApp : public olc::PixelGameEngine
 {
 public:
-    OneLoneCoder_Asteroids()
-    {
-        sAppName = "Asteroids";
-    }
+    int instanceId = -1;
+    size_t frameCount = 0;
+    std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
+    olc::Sprite gbaScreen;
+    std::chrono::time_point<std::chrono::high_resolution_clock> lastStatsTime;
 
 private:
-    struct sSpaceObject
-    {
-        int nSize;
-        float x;
-        float y;
-        float dx;
-        float dy;
-        float angle;
-    };
+    float accumulator = 0.0f;
+    // audio ring buffer (single-producer, single-consumer)
+    // Make the ring buffer larger to reduce underflow risk. This is the number of float samples (interleaved).
+    // At GBA_SAMPLE_RATE=32768 and 2 channels, 1<<16 samples ~= 1 second of audio. Increase to 2 seconds.
+    static constexpr size_t RING_BUFFER_SAMPLES = 1 << 17; // power of two (~2s)
+    static constexpr size_t RING_BUFFER_MASK = RING_BUFFER_SAMPLES - 1;
+    std::vector<float> audioRingBuffer;
+    std::atomic<uint64_t> rbWriteIndex{0};
+    std::atomic<uint64_t> rbReadIndex{0};
+    ma_device audioDevice;
+    bool audioInitialized = false;
+    uint32_t audioChannels = GBA_NUM_CHANNELS;
+    uint32_t audioSampleRate = GBA_SAMPLE_RATE;
+    std::vector<float> tempAudioFetch;
+    std::atomic<uint64_t> underflowCount{0};
+    std::atomic<uint64_t> overrunCount{0};
 
-    std::vector<sSpaceObject> vecAsteroids;
-    std::vector<sSpaceObject> vecBullets;
-    sSpaceObject player;
-    bool bDead = false;
-    int nScore = 0;
+    // Resampling state (produce device sample rate from emulator sample rate)
+    double resamplePosFrames = 0.0;         // fractional source-frame position relative to rbReadIndex
+    uint32_t producerSampleRate = GBA_SAMPLE_RATE; // source/emulator sample rate (Hz)
+    uint32_t deviceSampleRate = 0;         // actual device sample rate (Hz), discovered at runtime
 
-    std::vector<std::pair<float, float>> vecModelShip;
-    std::vector<std::pair<float, float>> vecModelAsteroid;
-    
-    std::map<std::string, olc::Renderable*> gfx;
-    std::map<std::string, int> sfx;
-
-    olc::MiniAudio audio;
-    
 public:
+
+    GBAEmulatorApp()
+    {
+        sAppName = "olc::PixelGameEngine GBA Emulator ";
+        this->instanceId = 0;
+        audioRingBuffer.resize(RING_BUFFER_SAMPLES);
+        tempAudioFetch.reserve(8192);
+        lastStatsTime = std::chrono::high_resolution_clock::now();
+    }
 
     bool OnUserCreate() override
     {
-        auto loadGraphic = [&](const std::string& key, const std::string& filepath)
-        {
-            olc::Renderable* renderable = new olc::Renderable();
-            renderable->Load(filepath);
-            gfx[key] = renderable;
-        };
-        
-        auto loadSound = [&](const std::string& key, const std::string& filepath)
-        {
-            sfx[key] = audio.LoadSound(filepath);
-        };
+        // Initialization code here
+        startTime = std::chrono::high_resolution_clock::now();
+        gbaScreen = olc::Sprite(SCREEN_WIDTH, SCREEN_HEIGHT);
 
-        loadGraphic("background", "assets/gfx/space.png");
-        
-        loadSound("bg-music",     "assets/sounds/bg-music.wav");
-        loadSound("laser",        "assets/sounds/Laser_Shoot11.wav");
-        loadSound("explosion",    "assets/sounds/Explosions1.wav");
-        loadSound("lose",         "assets/sounds/lose9.wav");
-        loadSound("thruster",     "assets/sounds/thruster.wav");
-
-        vecModelShip = 
-        {
-            { 0.0f, -5.0f},
-            {-2.5f, +2.5f},
-            {+2.5f, +2.5f}
-        }; // A simple Isoceles Triangle
-
-        // Create a "jagged" circle for the asteroid. It's important it remains
-        // mostly circular, as we do a simple collision check against a perfect
-        // circle.
-        int verts = 20;
-        for (int i = 0; i < verts; i++)
-        {
-            float noise = (float)rand() / (float)RAND_MAX * 0.4f + 0.8f;
-            vecModelAsteroid.push_back(std::make_pair(noise * sinf(((float)i / (float)verts) * 6.28318f), 
-                                                 noise * cosf(((float)i / (float)verts) * 6.28318f)));
+        // load rom
+        std::vector<uint8_t> romData = readFile("assets/roms/pokemon-emerald-version.gba");
+        if (romData.empty()) {
+            return false;
         }
 
-        backgroundLayer = CreateLayer();
-        EnableLayer(backgroundLayer, true);
+        // load bios
+        std::vector<uint8_t> biosData = readFile("assets/bios/gba_bios.bin");
+        if (biosData.empty()) {
+            return false;
+        }
+
+    // pass the BIOS buffer we loaded above (was previously nullptr)
+    this->instanceId = createInstance(romData.data(), romData.size(), biosData.data(), biosData.size(), "assets/saves/pokeemerald.sav");
+        if (this->instanceId == -1) {
+            return false;
+        }
+        // Initialize miniaudio device with ring-buffer callback
+        audioChannels = GBA_NUM_CHANNELS;
+        // producer sample rate is whatever the emulator reports
+        producerSampleRate = getSampleRate(this->instanceId);
+        audioSampleRate = producerSampleRate; // keep legacy variable populated
+
+        ma_device_config config = ma_device_config_init(ma_device_type_playback);
+        config.playback.format = ma_format_f32;
+        config.playback.channels = audioChannels;
+        // Prefer the system default device sample rate; set 0 to let miniaudio pick default if available.
+        // If the device ends up using a different sample-rate than the producer (GBA), we'll resample in the callback.
+        config.sampleRate = 0;
+        config.dataCallback = [](ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+            (void)pInput;
+            GBAEmulatorApp* app = (GBAEmulatorApp*)pDevice->pUserData;
+            float* out = (float*)pOutput;
+            const size_t outFrames = (size_t)frameCount;
+            const size_t channels = (size_t)app->audioChannels;
+
+            // Discover device sample rate once
+            uint32_t devRate = 0;
+            if (pDevice && pDevice->sampleRate > 0) {
+                devRate = (uint32_t)pDevice->sampleRate;
+            } else if (app->deviceSampleRate > 0) {
+                devRate = app->deviceSampleRate;
+            } else {
+                // fallback to producer rate if unknown
+                devRate = app->producerSampleRate;
+            }
+            if (app->deviceSampleRate == 0) app->deviceSampleRate = devRate;
+
+            const double srcRate = (double)app->producerSampleRate;
+            const double dstRate = (double)devRate;
+            const double srcPerDst = srcRate / dstRate; // how many source frames advance per 1 output frame
+
+            // snapshot indices
+            uint64_t r = app->rbReadIndex.load(std::memory_order_acquire);
+            uint64_t w = app->rbWriteIndex.load(std::memory_order_acquire);
+            uint64_t availSamples = (w >= r) ? (w - r) : 0;
+            uint64_t availFrames = availSamples / channels;
+
+            // local position measured in source frames (relative to r)
+            double pos = app->resamplePosFrames;
+
+            size_t outFrame = 0;
+            for (; outFrame < outFrames; ++outFrame) {
+                // required source frame indices
+                double srcPos = pos;
+                uint64_t i0 = (uint64_t)floor(srcPos);
+                uint64_t i1 = i0 + 1;
+
+                if (i1 >= availFrames) {
+                    // not enough source frames to interpolate pDevice further -> fill remaining with silence
+                    size_t remainingSamples = (outFrames - outFrame) * channels;
+                    memset(out + outFrame * channels, 0, remainingSamples * sizeof(float));
+                    break;
+                }
+
+                double frac = srcPos - (double)i0;
+
+                // read samples for frame i0 and i1, channel-by-channel
+                for (size_t ch = 0; ch < channels; ++ch) {
+                    uint64_t sampleIndex0 = r + (i0 * channels) + ch;
+                    uint64_t sampleIndex1 = r + (i1 * channels) + ch;
+                    size_t idx0 = (size_t)(sampleIndex0 & RING_BUFFER_MASK);
+                    size_t idx1 = (size_t)(sampleIndex1 & RING_BUFFER_MASK);
+                    float s0 = app->audioRingBuffer[idx0];
+                    float s1 = app->audioRingBuffer[idx1];
+                    out[outFrame * channels + ch] = (float)(s0 * (1.0 - frac) + s1 * frac);
+                }
+
+                pos += srcPerDst;
+            }
+
+            // Advance read index by the number of whole source frames consumed
+            uint64_t consumedFrames = (uint64_t)floor(pos);
+            if (consumedFrames > 0) {
+                app->rbReadIndex.store(r + consumedFrames * channels, std::memory_order_release);
+                pos -= (double)consumedFrames;
+            }
+
+            // store fractional remainder for next callback
+            app->resamplePosFrames = pos;
+
+            // If we broke out early due to insufficient source frames, we should count underflows
+            if (outFrame < outFrames) {
+                app->underflowCount.fetch_add((uint64_t)(outFrames - outFrame), std::memory_order_relaxed);
+            }
+        };
+        config.pUserData = this;
+
+        ma_result result = ma_device_init(nullptr, &config, &audioDevice);
+        if (result != MA_SUCCESS) {
+            fprintf(stderr, "Failed to init audio device: %d\n", result);
+        } else {
+            // Prefill ring buffer with ~100ms of audio to avoid immediate underflow when the device starts.
+            const double prefillSeconds = 0.100; // 100 ms
+            const uint64_t samplesNeeded = (uint64_t)(producerSampleRate * audioChannels * prefillSeconds);
+            uint64_t startW = rbWriteIndex.load(std::memory_order_acquire);
+            uint64_t startR = rbReadIndex.load(std::memory_order_acquire);
+            // Run a few frames until we've produced enough audio or a max iteration is reached.
+            int maxIters = 120; // don't spin forever
+            while ((rbWriteIndex.load(std::memory_order_acquire) - rbReadIndex.load(std::memory_order_acquire)) < samplesNeeded && maxIters-- > 0) {
+                updateSingleFrame(this->instanceId);
+                uint32_t sampleCount = getNumSamplesAvailable(this->instanceId);
+                if (sampleCount > 0) {
+                    tempAudioFetch.resize(sampleCount);
+                    uint32_t got = getCurrentFrameSoundSamples(this->instanceId, sampleCount, tempAudioFetch.data());
+                    if (got > 0) {
+                        uint64_t w = rbWriteIndex.load(std::memory_order_acquire);
+                        uint64_t r = rbReadIndex.load(std::memory_order_acquire);
+                        uint64_t free = RING_BUFFER_SAMPLES - (w - r);
+                        if (got > free) {
+                            // drop oldest samples to make room
+                            rbReadIndex.store(r + (got - free), std::memory_order_release);
+                            overrunCount.fetch_add(1, std::memory_order_relaxed);
+                            r = rbReadIndex.load(std::memory_order_acquire);
+                        }
+                        size_t toWrite = got;
+                        size_t first = std::min(toWrite, RING_BUFFER_SAMPLES - (size_t)(w & RING_BUFFER_MASK));
+                        memcpy(&audioRingBuffer[(size_t)(w & RING_BUFFER_MASK)], tempAudioFetch.data(), first * sizeof(float));
+                        if (first < toWrite) {
+                            size_t second = toWrite - first;
+                            memcpy(&audioRingBuffer[0], tempAudioFetch.data() + first, second * sizeof(float));
+                        }
+                        rbWriteIndex.store(w + toWrite, std::memory_order_release);
+                    }
+                }
+            }
+
+            // Now start the device
+            result = ma_device_start(&audioDevice);
+            if (result == MA_SUCCESS) {
+                audioInitialized = true;
+                // record actual device sample rate for resampler if available
+                if (audioDevice.sampleRate > 0) {
+                    deviceSampleRate = (uint32_t)audioDevice.sampleRate;
+                }
+            } else {
+                fprintf(stderr, "Failed to start audio device: %d\n", result);
+            }
+        }
         
-        SetDrawTarget(backgroundLayer);
-        DrawSprite(0,0, gfx.at("background")->Sprite());
-        SetDrawTarget(nullptr);
+        return true;
+    }
 
-        ResetGame();
-        audio.Play(sfx.at("bg-music"), true);
+    bool OnUserUpdate(float fElapsedTime) override
+    {
+        // Main update loop code here
+        accumulator += fElapsedTime;
+        while (accumulator >= frameTime) {
+            // Handle input
+            uint16_t keyState = 0;
+            for (int i = 0; i < MAX_KEYS; ++i) {
+                if (GetKey(keyMap[keys[i]]).bHeld) {
+                    keyState |= (1 << i);
+                }
+            }
 
+            pushKeys(this->instanceId, keyState);
+            /*frameCount++;
+            double rate = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+            std::cout << ("Update frame: " + std::to_string(frameCount) + "\t Rate: " + std::to_string(frameCount / (rate + 1e-6)) + " fps\n");*/
+            updateSingleFrame(this->instanceId);
+
+            // get audio samples and push into ring buffer
+            uint32_t sampleCount = getNumSamplesAvailable(this->instanceId);
+            if (sampleCount > 0) {
+                tempAudioFetch.resize(sampleCount);
+                uint32_t got = getCurrentFrameSoundSamples(this->instanceId, sampleCount, tempAudioFetch.data());
+                if (got > 0) {
+                    uint64_t w = rbWriteIndex.load(std::memory_order_acquire);
+                    uint64_t r = rbReadIndex.load(std::memory_order_acquire);
+                    uint64_t free = RING_BUFFER_SAMPLES - (w - r);
+                    if (got > free) {
+                        // drop oldest samples to make room
+                        rbReadIndex.store(r + (got - free), std::memory_order_release);
+                        r = rbReadIndex.load(std::memory_order_acquire);
+                    }
+                    size_t toWrite = got;
+                    size_t first = std::min(toWrite, RING_BUFFER_SAMPLES - (size_t)(w & RING_BUFFER_MASK));
+                    memcpy(&audioRingBuffer[(size_t)(w & RING_BUFFER_MASK)], tempAudioFetch.data(), first * sizeof(float));
+                    if (first < toWrite) {
+                        size_t second = toWrite - first;
+                        memcpy(&audioRingBuffer[0], tempAudioFetch.data() + first, second * sizeof(float));
+                    }
+                    rbWriteIndex.store(w + toWrite, std::memory_order_release);
+                }
+            }
+
+                // Print occasional audio stats (once per second)
+                auto now = std::chrono::high_resolution_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStatsTime).count() >= 1) {
+                    uint64_t w = rbWriteIndex.load(std::memory_order_acquire);
+                    uint64_t r = rbReadIndex.load(std::memory_order_acquire);
+                    uint64_t filled = w - r;
+                    fprintf(stderr, "audio: buffer filled=%zu samples underflow=%zu overrun=%zu\n", (size_t)filled, (size_t)underflowCount.load(), (size_t)overrunCount.load());
+                    lastStatsTime = now;
+                }
+
+            // Render frame
+            uint8_t* pixels = getCurrentFramePixels(this->instanceId);
+            
+            if (pixels) {
+                for (int y = 0; y < SCREEN_HEIGHT; ++y) {
+                    for (int x = 0; x < SCREEN_WIDTH; ++x) {
+                        uint32_t color = ((uint32_t*)pixels)[y * SCREEN_WIDTH + x];
+
+                        // pixel color is little endian (I think)
+                        this->gbaScreen.SetPixel(x, y, olc::Pixel(color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF));
+                        //Draw(x, y, olc::Pixel((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF));
+                    }
+                }
+            }
+
+            DrawSprite(0, 0, &this->gbaScreen);
+
+            accumulator -= frameTime;
+        }
         return true;
     }
 
     bool OnUserDestroy() override
     {
-        for(auto it = gfx.begin(); it != gfx.end(); ++it)
-        {
-            delete it->second;
+        // Cleanup code here
+        releaseInstance(this->instanceId);
+        if (audioInitialized) {
+            ma_device_uninit(&audioDevice);
+            audioInitialized = false;
         }
-
+        std::cout << "Emulator instance released." << std::endl;
         return true;
     }
 
-
-    int backgroundLayer = -1;
-
-    void ResetGame()
-    {
-        // Initialise Player Position
-        player.x = ScreenWidth() / 2.0f;
-        player.y = ScreenHeight() / 2.0f;
-        player.dx = 0.0f;
-        player.dy = 0.0f;
-        player.angle = 0.0f;
-
-        vecBullets.clear();
-        vecAsteroids.clear();
-
-        // Put in two asteroids
-        vecAsteroids.push_back({ (int)16, player.x - 80.0f, player.y,  10.0f,  40.0f, 0.0f });
-        vecAsteroids.push_back({ (int)16, player.x + 80.0f, player.y, -10.0f, -40.0f, 0.0f });
-
-        // Reset game
-        bDead = false;
-        nScore = false;
-    }
-
-    // Implements "wrap around" for various in-game sytems
-    void WrapCoordinates(float ix, float iy, float &ox, float &oy)
-    {
-        ox = ix;
-        oy = iy;
-        if (ix < 0.0f)	ox = ix + (float)ScreenWidth();
-        if (ix >= (float)ScreenWidth())	ox = ix - (float)ScreenWidth();
-        if (iy < 0.0f)	oy = iy + (float)ScreenHeight();
-        if (iy >= (float)ScreenHeight()) oy = iy - (float)ScreenHeight();
-    }
-
-    // Overriden to handle toroidal drawing routines
-    bool Draw(int x, int y, olc::Pixel col = olc::WHITE) override
-    {
-        float fx, fy;
-        WrapCoordinates(x, y, fx, fy);		
-        return olc::PixelGameEngine::Draw(fx, fy, col);
-    }
-
-    bool IsPointInsideCircle(float cx, float cy, float radius, float x, float y)
-    {
-        return sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy)) < radius;
-    }
-
-    // Called by olcConsoleGameEngine
-    bool OnUserUpdate(float fElapsedTime) override
-    {
-        if (bDead)
-            ResetGame();
-        
-        // Clear Screen
-        Clear(olc::BLANK);
-
-        // Steer Ship
-        if (GetKey(olc::LEFT).bHeld)
-            player.angle -= 5.0f * fElapsedTime;
-        if (GetKey(olc::RIGHT).bHeld)
-            player.angle += 5.0f * fElapsedTime;
-
-        // Thrust? Apply ACCELERATION
-        if (GetKey(olc::UP).bHeld)
-        {
-            // ACCELERATION changes VELOCITY (with respect to time)
-            player.dx += sin(player.angle) * 20.0f * fElapsedTime;
-            player.dy += -cos(player.angle) * 20.0f * fElapsedTime;
-        }
-
-        if(GetKey(olc::UP).bPressed)
-            audio.Play(sfx.at("thruster"), true);
-        
-        if(GetKey(olc::UP).bReleased)
-            audio.Stop(sfx.at("thruster"));
-
-        // VELOCITY changes POSITION (with respect to time)
-        player.x += player.dx * fElapsedTime;
-        player.y += player.dy * fElapsedTime;
-
-        // Keep ship in gamespace
-        WrapCoordinates(player.x, player.y, player.x, player.y);
-
-        // Check ship collision with asteroids
-        for (auto &a : vecAsteroids)
-            if (IsPointInsideCircle(a.x, a.y, a.nSize, player.x, player.y))
-            {
-                bDead = true; // Uh oh...
-                audio.Play(sfx.at("lose"));
-            }
-                
-
-        // Fire Bullet in direction of player
-        if (GetKey(olc::SPACE).bReleased)
-        {
-            vecBullets.push_back({ 0, player.x, player.y, 150.0f * sinf(player.angle), -150.0f * cosf(player.angle), 100.0f });
-            audio.Play(sfx.at("laser"));
-        }
-            
-
-        // Update and draw asteroids
-        for (auto &a : vecAsteroids)
-        {
-            // VELOCITY changes POSITION (with respect to time)
-            a.x += a.dx * fElapsedTime;
-            a.y += a.dy * fElapsedTime;
-            a.angle += 0.5f * fElapsedTime; // Add swanky rotation :)
-
-            // Asteroid coordinates are kept in game space (toroidal mapping)
-            WrapCoordinates(a.x, a.y, a.x, a.y);
-
-            // Draw Asteroids
-            DrawWireFrameModel(vecModelAsteroid, a.x, a.y, a.angle, (float)a.nSize, olc::YELLOW);	
-        }
-
-        // Any new asteroids created after collision detection are stored
-        // in a temporary vector, so we don't interfere with the asteroids
-        // vector iterator in the for(auto)
-        std::vector<sSpaceObject> newAsteroids;
-
-        // Update Bullets
-        for (auto &b : vecBullets)
-        {
-            b.x += b.dx * fElapsedTime;
-            b.y += b.dy * fElapsedTime;
-            WrapCoordinates(b.x, b.y, b.x, b.y);
-            b.angle -= 1.0f * fElapsedTime;
-
-            // Check collision with asteroids
-            for (auto &a : vecAsteroids)
-            {
-                //if (IsPointInsideRectangle(a.x, a.y, a.x + a.nSize, a.y + a.nSize, b.x, b.y))
-                if(IsPointInsideCircle(a.x, a.y, a.nSize, b.x, b.y))
-                {
-                    // Asteroid Hit - Remove bullet
-                    // We've already updated the bullets, so force bullet to be offscreen
-                    // so it is cleaned up by the removal algorithm. 
-                    b.x = -100;
-
-                    // Create child asteroids
-                    if (a.nSize > 4)
-                    {
-                        float angle1 = ((float)rand() / (float)RAND_MAX) * 6.283185f;
-                        float angle2 = ((float)rand() / (float)RAND_MAX) * 6.283185f;
-                        newAsteroids.push_back({ (int)a.nSize >> 1 ,a.x, a.y, 30.0f * sinf(angle1), 30.0f * cosf(angle1), 0.0f });
-                        newAsteroids.push_back({ (int)a.nSize >> 1 ,a.x, a.y, 30.0f * sinf(angle2), 30.0f * cosf(angle2), 0.0f });
-                    }
-
-                    // Remove asteroid - Same approach as bullets
-                    a.x = -100;
-                    nScore += 100; // Small score increase for hitting asteroid
-                    audio.Play(sfx.at("explosion"));
-                }
-            }
-        }
-
-        // Append new asteroids to existing vector
-        for(auto a:newAsteroids)
-            vecAsteroids.push_back(a);
-
-        // Clear up dead objects - They are out of game space
-
-        // Remove asteroids that have been blown up
-        if (vecAsteroids.size() > 0)
-        {
-            auto i = remove_if(vecAsteroids.begin(), vecAsteroids.end(), [&](sSpaceObject o) { return (o.x < 0); });
-            if (i != vecAsteroids.end())
-                vecAsteroids.erase(i);
-        }
-
-        if (vecAsteroids.empty()) // If no asteroids, level complete! :) - you win MORE asteroids!
-        {
-            // Level Clear
-            nScore += 1000; // Large score for level progression
-            vecAsteroids.clear();
-            vecBullets.clear();
-
-            // Add two new asteroids, but in a place where the player is not, we'll simply
-            // add them 90 degrees left and right to the player, their coordinates will
-            // be wrapped by th enext asteroid update
-        vecAsteroids.push_back({ (int)16, 80.0f * sinf(player.angle - 3.14159f/2.0f) + player.x,
-                                            80.0f * cosf(player.angle - 3.14159f/2.0f) + player.y,
-                                            60.0f * sinf(player.angle), 60.0f*cosf(player.angle), 0.0f });
-
-        vecAsteroids.push_back({ (int)16, 80.0f * sinf(player.angle + 3.14159f/2.0f) + player.x,
-                                            80.0f * cosf(player.angle + 3.14159f/2.0f) + player.y,
-                                            60.0f * sinf(-player.angle), 60.0f*cosf(-player.angle), 0.0f });
-        }
-
-        // Remove bullets that have gone off screen
-        if (vecBullets.size() > 0)
-        {
-            auto i = remove_if(vecBullets.begin(), vecBullets.end(), [&](sSpaceObject o) { return (o.x < 1 || o.y < 1 || o.x >= ScreenWidth() - 1 || o.y >= ScreenHeight() - 1); });
-            if (i != vecBullets.end())
-                vecBullets.erase(i);
-        }
-
-        // Draw Bullets
-        for (auto b : vecBullets)
-            Draw(b.x, b.y);
-
-        // Draw Ship
-        DrawWireFrameModel(vecModelShip, player.x, player.y, player.angle);
-
-        // Draw Score
-        DrawString(2, 2, "SCORE: " + std::to_string(nScore));
-        
-        return !GetKey(olc::ESCAPE).bPressed;
-    }
-
-    void DrawWireFrameModel(const std::vector<std::pair<float, float>> &vecModelCoordinates, float x, float y, float r = 0.0f, float s = 1.0f, olc::Pixel col = olc::WHITE)
-    {
-        // pair.first = x coordinate
-        // pair.second = y coordinate
-        
-        // Create translated model vector of coordinate pairs
-        std::vector<std::pair<float, float>> vecTransformedCoordinates;
-        int verts = vecModelCoordinates.size();
-        vecTransformedCoordinates.resize(verts);
-
-        // Rotate
-        for (int i = 0; i < verts; i++)
-        {
-            vecTransformedCoordinates[i].first = vecModelCoordinates[i].first * cosf(r) - vecModelCoordinates[i].second * sinf(r);
-            vecTransformedCoordinates[i].second = vecModelCoordinates[i].first * sinf(r) + vecModelCoordinates[i].second * cosf(r);
-        }
-
-        // Scale
-        for (int i = 0; i < verts; i++)
-        {
-            vecTransformedCoordinates[i].first = vecTransformedCoordinates[i].first * s;
-            vecTransformedCoordinates[i].second = vecTransformedCoordinates[i].second * s;
-        }
-
-        // Translate
-        for (int i = 0; i < verts; i++)
-        {
-            vecTransformedCoordinates[i].first = vecTransformedCoordinates[i].first + x;
-            vecTransformedCoordinates[i].second = vecTransformedCoordinates[i].second + y;
-        }
-
-        // Draw Closed Polygon
-        for (int i = 0; i < verts + 1; i++)
-        {
-            int j = (i + 1);
-            DrawLine(vecTransformedCoordinates[i % verts].first, vecTransformedCoordinates[i % verts].second, 
-                vecTransformedCoordinates[j % verts].first, vecTransformedCoordinates[j % verts].second, col);
-        }
-    }
 };
 
+int main() {
+    GBAEmulatorApp app;
 
-int main()
-{
-    OneLoneCoder_Asteroids game;
-    if(game.Construct(320, 180, 4, 4))
-        game.Start();
+    if (app.Construct(SCREEN_WIDTH, SCREEN_HEIGHT, 2, 2)) {
+        app.Start();
+    }
+    
 
     return 0;
 }
 
+std::vector<uint8_t> readFile(const char* filepath) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        return {};
+    }
+    file.unsetf(std::ios::skipws);
+    std::streampos fileSize;
+
+    file.seekg(0, std::ios::end);
+    fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> vec;
+    vec.reserve(fileSize);
+
+    vec.insert(vec.begin(),
+        std::istream_iterator<uint8_t>(file),
+        std::istream_iterator<uint8_t>());
+
+    return vec;
+}
